@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Smart Goggles – Advanced AI Edition</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+  
+  <style>
+    :root {
+      --primary: #00e5ff;
+      --bg: #0a0a0a;
+      --panel: #1a1a1a;
+    }
+    body {
+      background: var(--bg);
+      color: white;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    #initOverlay {
+      position: fixed;
+      top: 0; left: 0; width: 100%; height: 100%;
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      z-index: 1000;
+    }
+    .big-btn {
+      padding: 20px 40px;
+      font-size: 24px;
+      background: var(--primary);
+      color: black;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+      font-weight: bold;
+      box-shadow: 0 4px 15px rgba(0, 229, 255, 0.4);
+    }
+    .controls {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+    button {
+      padding: 12px 20px;
+      cursor: pointer;
+      background: var(--panel);
+      color: var(--primary);
+      border: 1px solid var(--primary);
+      border-radius: 8px;
+      font-weight: bold;
+      font-size: 16px;
+      transition: all 0.2s;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      border-color: #555;
+      color: #555;
+    }
+    button:active {
+      background: var(--primary);
+      color: black;
+    }
+    #status {
+      width: 100%;
+      max-width: 400px;
+      min-height: 60px;
+      font-size: 18px;
+      background: var(--panel);
+      padding: 15px;
+      border-radius: 12px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-left: 5px solid var(--primary);
+    }
+    .vision-container {
+      position: relative;
+      width: 100%;
+      max-width: 400px;
+      border-radius: 12px;
+      overflow: hidden;
+      border: 2px solid #333;
+    }
+    video, canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div id="initOverlay">
+    <h2>🕶️ Smart Goggles</h2>
+    <p>Tap below to initialize AI, Camera, and Voice.</p>
+    <button class="big-btn" id="initBtn">Initialize System</button>
+  </div>
+
+  <h2>System Dashboard</h2>
+  <div id="status">Waiting for system initialization...</div>
+
+  <div class="controls">
+    <button id="cmdBtn" disabled>🎤 Voice Command</button>
+    <button id="pauseBtn" disabled>⏸ Pause AI</button>
+  </div>
+
+  <div class="vision-container">
+    <video id="video" playsinline autoplay muted></video>
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <script>
+    // ======================= CONFIGURATION =======================
+    const OPENWEATHER_API_KEY = 'YOUR_KEY_HERE'; 
+    const OPENROUTESERVICE_KEY = 'YOUR_KEY_HERE';
+    
+    // AI Parameters
+    const CONFIDENCE_THRESHOLD = 0.55; // Ignore objects the AI isn't sure about
+    const COOLDOWN_MS = 3500;          // Wait 3.5s before repeating the same obstacle warning
+    
+    // Global State
+    let model = null;
+    let stream = null;
+    let isDetecting = false;
+    let lastSpokenObject = "";
+    let lastSpokenTime = 0;
+    let speechVoice = null;
+
+    // ======================= SPEECH & AUDIO =======================
+    function setupVoice() {
+      const voices = window.speechSynthesis.getVoices();
+      // Try to find a premium, natural-sounding English voice
+      speechVoice = voices.find(v => v.name.includes('Premium') || v.name.includes('Google') && v.lang.startsWith('en')) 
+                    || voices.find(v => v.lang.startsWith('en')) 
+                    || voices[0];
+    }
+
+    // Ensure voices load (browsers load them asynchronously)
+    window.speechSynthesis.onvoiceschanged = setupVoice;
+
+    function speak(text, priority = false) {
+      console.log('AI Voice:', text);
+      document.getElementById('status').innerText = text;
+      
+      // If priority (like imminent collision), stop current speech and talk immediately
+      if (priority) window.speechSynthesis.cancel();
+      
+      if (window.speechSynthesis.speaking && !priority) return;
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      if (speechVoice) utterance.voice = speechVoice;
+      utterance.rate = 1.05; // Slightly faster for quick feedback
+      utterance.pitch = 1.0;
+      window.speechSynthesis.speak(utterance);
+    }
+
+    // ======================= CORE AI & CAMERA =======================
+    async function initializeSystem() {
+      document.getElementById('initBtn').innerText = "Loading AI Core...";
+      document.getElementById('initBtn').disabled = true;
+
+      // 1. Wake up Speech Synthesis (requires user gesture)
+      setupVoice();
+      speak("System initializing. Please wait.");
+
+      try {
+        // 2. Load AI Model
+        model = await cocoSsd.load();
+        
+        // 3. Request Camera
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } } 
+        });
+        
+        const video = document.getElementById("video");
+        video.srcObject = stream;
+        
+        video.onloadedmetadata = () => {
+          const canvas = document.getElementById("canvas");
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          
+          document.getElementById('initOverlay').style.display = 'none';
+          document.getElementById('cmdBtn').disabled = false;
+          document.getElementById('pauseBtn').disabled = false;
+          
+          isDetecting = true;
+          speak("Environment scanning active.");
+          detectLoop();
+        };
+
+      } catch (err) {
+        console.error(err);
+        document.getElementById('initBtn').innerText = "Camera/AI Error. Retry.";
+        document.getElementById('initBtn').disabled = false;
+        alert("Failed to access camera or load AI. Ensure you are on HTTPS and granted permissions.");
+      }
+    }
+
+    // ======================= SPATIAL AWARENESS LOGIC =======================
+    async function detectLoop() {
+      if (!isDetecting) return;
+
+      const video = document.getElementById("video");
+      const canvas = document.getElementById("canvas");
+      const ctx = canvas.getContext("2d");
+
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        // Run AI Inference
+        const predictions = await model.detect(video);
+        
+        // Filter high confidence
+        const validObjects = predictions.filter(p => p.score > CONFIDENCE_THRESHOLD);
+        
+        if (validObjects.length > 0) {
+          // Find the most "threatening" object (largest area relative to screen)
+          const largestObj = validObjects.reduce((prev, curr) => 
+            (curr.bbox[2] * curr.bbox[3] > prev.bbox[2] * prev.bbox[3]) ? curr : prev
+          );
+
+          const [x, y, width, height] = largestObj.bbox;
+          const centerX = x + (width / 2);
+          
+          // Calculate Spatial Location
+          let horizontalPos = "ahead";
+          if (centerX < canvas.width * 0.65) horizontalPos = "on the left";
+          else if (centerX > canvas.width * 0.65) horizontalPos = "on the right";
+
+          // Calculate Proximity (Depth approximation based on screen area coverage)
+          const screenArea = canvas.width * canvas.height;
+          const objectArea = width * height;
+          const coverage = objectArea / screenArea;
+          
+          let proximity = "far";
+          let isDanger = false;
+
+          if (coverage > 0.50) {
+            proximity = "imminent";
+            isDanger = true;
+          } else if (coverage > 0.20) {
+            proximity = "very close";
+          } else if (coverage > 0.08) {
+            proximity = "near";
+          }
+
+          // Visual Debugging on Canvas
+          ctx.strokeStyle = isDanger ? "#ff0000" : "#00e5ff";
+          ctx.lineWidth = isDanger ? 4 : 2;
+          ctx.strokeRect(x, y, width, height);
+          ctx.fillStyle = isDanger ? "#ff0000" : "#00e5ff";
+          ctx.font = "16px Arial";
+          ctx.fillText(`${largestObj.class} (${proximity})`, x, y > 20 ? y - 5 : y + 20);
+
+          // Audio Alert Logic (Debouncing to prevent spam)
+          const alertString = `${largestObj.class}_${horizontalPos}_${proximity}`;
+          const now = Date.now();
+
+          if (isDanger && (now - lastSpokenTime > 2000)) {
+            // Priority alert for imminent collision
+            speak(`Warning, ${largestObj.class} immediately ${horizontalPos}!`, true);
+            lastSpokenTime = now;
+            lastSpokenObject = alertString;
+          } else if (alertString !== lastSpokenObject || (now - lastSpokenTime > COOLDOWN_MS)) {
+            // Normal spatial awareness update
+            speak(`${largestObj.class} ${proximity} ${horizontalPos}`);
+            lastSpokenTime = now;
+            lastSpokenObject = alertString;
+          }
+        } else {
+          // Path clear logic - gently reset state without spamming "path clear" continuously
+          if (lastSpokenObject !== "clear" && (Date.now() - lastSpokenTime > COOLDOWN_MS)) {
+            document.getElementById('status').innerText = "Path appears clear.";
+            lastSpokenObject = "clear";
+          }
+        }
+      }
+
+      // Loop efficiently
+      requestAnimationFrame(detectLoop);
+    }
+
+    // ======================= VOICE COMMANDS =======================
+    function listenForCommand() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognition) {
+        speak("Voice commands are not supported on this browser.");
+        return;
+      }
+      
+      const recognition = new SpeechRecognition();
+      recognition.lang = 'en-US';
+      recognition.interimResults = false;
+
+      // Pause detection while listening so it doesn't talk over the user
+      const wasDetecting = isDetecting;
+      isDetecting = false;
+      
+      speak("Listening.", true);
+
+      recognition.onstart = () => {
+        document.getElementById('cmdBtn').innerText = "Listening...";
+      };
+
+      recognition.onresult = (event) => {
+        const cmd = event.results[0][0].transcript.toLowerCase();
+        console.log('Command:', cmd);
+        
+        if (cmd.includes('weather')) {
+          speak("Weather feature requires valid API keys in the code.");
+        } else if (cmd.includes('navigate')) {
+          speak("Navigation feature requires valid API keys.");
+        } else {
+          speak("I heard you say " + cmd + ". Command not recognized.");
+        }
+      };
+
+      recognition.onend = () => {
+        document.getElementById('cmdBtn').innerText = "🎤 Voice Command";
+        if (wasDetecting) isDetecting = true;
+      };
+
+      recognition.start();
+    }
+
+    // ======================= EVENT LISTENERS =======================
+    document.getElementById('initBtn').addEventListener('click', initializeSystem);
+    document.getElementById('cmdBtn').addEventListener('click', listenForCommand);
+    document.getElementById('pauseBtn').addEventListener('click', () => {
+      isDetecting = !isDetecting;
+      document.getElementById('pauseBtn').innerText = isDetecting ? "⏸ Pause AI" : "▶ Resume AI";
+      speak(isDetecting ? "Resuming environment scan." : "Scanning paused.", true);
+      if (isDetecting) detectLoop();
+    });
+
+  </script>
+</body>
+</html>
